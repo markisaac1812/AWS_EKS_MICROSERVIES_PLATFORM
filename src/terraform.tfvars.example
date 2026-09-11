@@ -1,0 +1,54 @@
+# Copy this file to terraform.tfvars and adjust values for your environment.
+
+aws_region   = "us-east-1"
+project_name = "saa-manara"
+environment  = "production"
+
+vpc_cidr           = "10.0.0.0/16"
+az_count           = 3
+single_nat_gateway = false
+
+cluster_version = "1.29"
+
+core_node_group = {
+  instance_types = ["m6i.large"]
+  min_size       = 2
+  max_size       = 5
+  desired_size   = 2
+  capacity_type  = "ON_DEMAND"
+}
+
+commerce_node_group = {
+  instance_types = ["m6i.large"]
+  min_size       = 2
+  max_size       = 6
+  desired_size   = 2
+  capacity_type  = "ON_DEMAND"
+}
+
+search_node_group = {
+  instance_types = ["m6i.large"]
+  min_size       = 2
+  max_size       = 5
+  desired_size   = 2
+  capacity_type  = "ON_DEMAND"
+}
+
+rds_instance_class    = "db.t3.medium"
+rds_allocated_storage = 50
+rds_multi_az          = true
+
+aurora_instance_class = "db.r6g.large"
+aurora_instance_count = 2
+
+kafka_broker_instance_type = "kafka.m5.large"
+kafka_ebs_volume_size      = 100
+
+redis_node_type          = "cache.r6g.large"
+redis_num_cache_clusters = 3
+
+ses_sender_email = "no-reply@example.com"
+
+tags = {
+  Owner = "platform-team"
+}

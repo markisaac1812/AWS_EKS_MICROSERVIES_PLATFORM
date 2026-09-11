@@ -1,0 +1,72 @@
+**/.terraform/*
+.terraform/
+.terraform.lock.hcl
+
+# State files - these contain secrets in plaintext, never commit them
+*.tfstate
+*.tfstate.*
+*.tfstate.backup
+
+# Crash logs
+crash.log
+crash.*.log
+
+# Variable files that may contain secrets/environment-specific values
+*.tfvars
+*.tfvars.json
+!*.tfvars.example
+
+# Terraform CLI config / credentials
+.terraformrc
+terraform.rc
+
+# Plan output
+*.tfplan
+*.plan
+
+# Override files (local-only tweaks, shouldn't be shared)
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# ==============================
+# Lambda build artifacts
+# ==============================
+src/build/
+**/*.zip
+
+# ==============================
+# Secrets / credentials
+# ==============================
+.env
+.env.*
+*.pem
+*.key
+*.crt
+kubeconfig
+kubeconfig.yaml
+**/aws-credentials*
+
+# ==============================
+# Python (lambda_src)
+# ==============================
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# ==============================
+# OS / editor noise
+# ==============================
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+
+# ==============================
+# Logs
+# ==============================
+*.log

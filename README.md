@@ -2,64 +2,62 @@
 
 ![Architecture diagram](docs/architecture-diagram.png)
 
-The Terraform that actually provisions all of this lives in [`src/`](src/). This file is the "read this first" explanation — what the diagram is showing, the reasoning behind each piece, and the tradeoffs I made along the way.
+# Architecture Notes
 
-## The big picture
+Terraform for all of this is in [`src/`](src/). This doc just walks through what's actually in the diagram and why it's laid out this way — mostly so I remember my own reasoning in six months, but also useful if someone else has to touch this.
 
-Everything sits inside a single VPC. In the middle of it is an EKS cluster, and instead of throwing every microservice into one big node pool, I split the workloads into three node groups based on how they're used and how they scale:
+## Layout
 
-- **Group 1** – `auth`, `users`, `reservations`. These are the "core" services that basically everything else depends on. They're chatty but not resource-heavy, so they share a node group.
-- **Group 2** – `media`, `payment`, `sessions`. These get bursty traffic (uploads, checkout spikes) so I wanted them isolated from the core services — if payment traffic spikes and that node group scales up, it shouldn't starve auth.
-- **Group 3** – `search` and `locations`. These two talk to relational databases (Aurora and RDS) instead of DynamoDB, so I kept them together and separate from everything else — different scaling pattern, different blast radius if something goes wrong with a query.
+Single VPC. EKS cluster in the middle, traffic comes in through a Network Load Balancer. Went with NLB over ALB here on purpose — almost everything downstream is internal TCP traffic between services, not HTTP traffic that needs path-based routing. Any L7 routing decisions happen inside the cluster via the ingress controller, not at the edge.
 
-A Network Load Balancer sits in front of the cluster and routes traffic down into whichever service needs it. I went with an NLB instead of an ALB because most of this traffic is plain TCP between internal services and I didn't need layer-7 routing rules at the edge — that logic lives inside the cluster with an ingress controller instead.
+Three node groups, split by how the services behave rather than just spreading pods evenly:
 
-## Why "one database per service"
+| Node group | Services | Reasoning |
+|---|---|---|
+| 1 | `auth`, `users`, `reservations` | Core stuff, everything else depends on these. High request volume but cheap requests — lots of small reads, not much CPU. |
+| 2 | `media`, `payment`, `sessions` | Traffic is spiky (checkout, uploads). Kept separate so a payment spike doesn't eat CPU/memory headroom that auth needs. |
+| 3 | `search`, `locations` | Only two services that talk to relational DBs instead of DynamoDB. Different failure mode if a query goes bad, so isolated on its own node group. |
 
-You'll notice `auth`, `users`, `reservations`, `media`, `payment`, and `sessions` each get their own database. That's on purpose — it's the classic database-per-service pattern. I picked DynamoDB for these because:
+## Data layer
 
-- Each service owns its own data and its own schema. Nobody has to ask permission to change a table because someone else's service also reads from it.
-- These are mostly key-value / lookup-style access patterns (get a user by ID, get a reservation by ID), which is exactly what DynamoDB is good at.
-- Pay-per-request billing means I'm not paying for idle capacity on services that don't get constant traffic.
+Most services get their own DynamoDB table — `auth db`, `user db`, `reservations db`, `media db`, `payment db`, `session db`. This wasn't a default choice, it's deliberate: each service owns its schema, and nobody has to coordinate a migration with another team because they happen to read the same table. Access patterns here are basically all get-by-id lookups, which is the exact case DynamoDB is built for, and pay-per-request billing means the low-traffic services aren't burning money sitting idle.
 
-`search` and `locations` are the odd ones out — they need actual relational queries (joins, geo lookups, full-text-ish search), so they sit on Aurora and RDS Postgres instead of DynamoDB. Aurora backs `search` because it needs to scale reads independently of writes (Aurora replicas), and `locations` runs on plain RDS since its read/write pattern is simpler and doesn't justify Aurora's extra cost.
+`search` and `locations` break that pattern. Search needs to scale reads separately from writes (hence Aurora, which supports read replicas cleanly), and locations does simpler geo/relational queries where plain RDS Postgres is enough — didn't see the point paying Aurora's premium there.
 
-Media files themselves (images, video, whatever gets uploaded) don't belong in a database at all, so those go straight to S3, with a small DynamoDB table (`media db`) just tracking metadata about each object — owner, upload time, status, etc.
+Media files go straight to S3, not into any database. The `media db` table next to it isn't storing the files, it's tracking metadata — owner, upload timestamp, processing status. Actual bytes never touch DynamoDB.
 
-## Kafka, the notification service, and why there's a "notification db"
+## Kafka / notifications / that weird little "notification db"
 
-This is the part of the diagram that looks over-engineered until you think about what it's actually solving: **making sure a customer never gets the same email twice.**
+This part looks like over-engineering until you hit the actual problem: Kafka + Lambda gives you at-least-once delivery, not exactly-once. So a "payment failed" event can legitimately fire twice, and if the notifications Lambda just sends an email every time it sees an event, customers get duplicate emails.
 
-Here's the flow: services publish events onto Kafka (Amazon MSK) — "reservation confirmed," "payment failed," whatever. A Lambda function (`notifications service`) picks those events up and is responsible for sending them out. The problem with any event-driven system is that messages can get delivered more than once — that's just a fact of life with Kafka consumers, retries, and Lambda's at-least-once delivery guarantee.
+The `notification db` table exists to solve exactly that. Before sending anything, the Lambda checks if it's already processed that event ID. Already processed → drop it. Not processed → send, then write the ID so it can't fire again. It's not a notification history store, it's purely an idempotency check — outbox pattern, basically, just implemented with DynamoDB instead of a dedicated outbox table.
 
-So before the Lambda actually sends anything, it checks the `notification db` (DynamoDB) to see if that event ID has already been processed. If it has, it just drops the message. If not, it sends the notification and writes a record so it never fires again for that same event. That's the outbox / idempotency pattern in the diagram's own words — it's not there to store notification content long-term, it's there purely so duplicate events don't turn into duplicate emails.
+## Redis
 
-## Redis cluster
+ElastiCache cluster sits off on its own, not owned by any single node group, since it's used across services — session lookups, caching reads that would otherwise keep hitting DynamoDB/Aurora/RDS for the same data. Gets its own subnet and security group because it's shared infra, not tied to one service's IAM boundary.
 
-Sitting off to the side is a Redis cluster (ElastiCache), shared across services. This isn't tied to one microservice — it's there for things like session lookups and caching hot data so services aren't hammering DynamoDB/RDS/Aurora for the same reads over and over. Since it's shared infrastructure, it gets its own subnet and security group rather than living inside any one node group.
+## Networking
 
-## Subnets, NAT gateways, and endpoints — the boring but important part
+Every node group and every database sits in a private subnet — no public IPs anywhere on compute or data. Public subnets only hold two things: the NAT gateways and the load balancer.
 
-Every node group lives in a **private subnet**. None of the worker nodes have a public IP, and none of the databases do either. The only things that touch a public subnet are the NAT gateways and the load balancer.
+NAT gateways exist mainly so nodes can pull container images (ECR, Docker Hub) — that's the one thing that genuinely needs outbound internet access on a regular basis. Everything else that talks to AWS APIs a lot (S3, DynamoDB, ECR, STS, Secrets Manager, CloudWatch Logs) goes through VPC endpoints instead, so that traffic stays on AWS's internal network. Two upsides: it's cheaper (NAT gateways bill per GB processed) and it never has to leave AWS's network at all.
 
-The NAT gateways exist for one reason mainly: pulling container images. Nodes need to reach ECR (or Docker Hub, if that's where an image lives) to pull images when pods start up, and that means outbound internet access. Rather than route *all* AWS API traffic through the NAT gateway, I added VPC endpoints for the services nodes talk to constantly — S3, DynamoDB, ECR, STS, Secrets Manager, CloudWatch Logs. That traffic goes over AWS's private network instead of out through NAT, which is both cheaper (NAT gateways charge per GB) and more secure (it never touches the public internet at all).
+## IAM / IRSA
 
-## How pods actually get permission to touch AWS resources
+Didn't want one cluster-wide IAM role that can touch everything — that turns any single compromised pod into a path to every service's data. Each node group's service account maps to its own role instead:
 
-I didn't want to give every node in the cluster a single IAM role with access to everything — that means a bug in one service could touch another service's database. Instead, each node group's service account is mapped to its own IAM role via IRSA (IAM Roles for Service Accounts):
+- Core node group → read/write on `auth`, `users`, `reservations` tables only
+- Commerce node group → `media`, `payment`, `sessions` tables + the S3 media bucket only
+- Search node group → Secrets Manager access to pull Aurora/RDS credentials, no DynamoDB access at all
 
-- The core-services group can only read/write `auth`, `users`, and `reservations` tables.
-- The commerce-services group can only touch `media`, `payment`, `sessions`, and the S3 media bucket.
-- The search-services group only gets permission to pull credentials for Aurora/RDS out of Secrets Manager — it never touches DynamoDB at all.
+Keeps blast radius contained to whatever that service actually owns.
 
-That way if one service's pod gets compromised or misconfigured, the blast radius is limited to that service's own data.
+## Known gaps / what I'd fix next
 
-## What I'd call out if someone asked "what would you change with more time"
+- NLB target groups are static placeholders in the current Terraform. In a real deployment this needs to be the AWS Load Balancer Controller doing dynamic target registration off Kubernetes Service/Ingress objects — pod IPs aren't stable enough for a static config.
+- No Kafka topic ACLs or schema registry yet. Fine with one producer, not fine once more than one team is publishing events.
+- Autoscaling is one generic Cluster Autoscaler config right now. The three node groups have different enough traffic shapes (steady vs. bursty vs. query-heavy) that they should really have separate scaling policies.
 
-- Right now the NLB target groups are static placeholders in Terraform — in a real rollout, target registration should be handled dynamically by the AWS Load Balancer Controller based on Kubernetes Service/Ingress objects, since pod IPs change constantly.
-- Kafka topic-level ACLs and schema registry aren't modeled here — worth adding once there's more than one team producing events.
-- I'd add autoscaling policies tuned per node group instead of one generic Cluster Autoscaler config, since the three groups have very different traffic shapes.
+## Where the code is
 
-## Where the actual infrastructure code lives
-
-All of this is provisioned with Terraform under [`src/`](src/) — VPC, EKS, node groups, DynamoDB tables, S3, Aurora, RDS, MSK, ElastiCache, the notifications Lambda, IAM/IRSA roles, and the supporting security groups. See `src/README.md` for the file-by-file breakdown and how to run it.
+Terraform for all of this — VPC, EKS + node groups, DynamoDB tables, S3, Aurora, RDS, MSK, ElastiCache, the notifications Lambda, IAM/IRSA roles, security groups — lives under [`src/`](src/). `src/README.md` has the file-by-file breakdown and setup instructions.
